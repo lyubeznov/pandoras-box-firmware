@@ -1,6 +1,6 @@
 #include <ESP8266WiFi.h>
-#include <ESPAsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <ESP8266WebServer.h>
+#include <FS.h>
 #include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
@@ -15,7 +15,7 @@ const char* password = "666pand0ra666";
 IPAddress apIP(192, 168, 4, 1);
 DNSServer dnsServer;
 
-AsyncWebServer server(80);
+ESP8266WebServer server(80);
 
 const int LEDS_PORT = 2;
 const int LEDS_COUNT = 91;
@@ -29,13 +29,23 @@ void configureOTA();
 void configureLeds();
 void configureServer();
 
+void handlePing();
+void handlePower();
+void handleColor();
+void handleBrightness();
+void handleConfiguration();
+void handleDefault();
+
+void sendNotFound();
+void sendBadRequest();
+void sendOk();
+void sendOKJson(JsonObject &buffer);
+
+bool reinitConfiguration(File file);
 void getConfiguration(JsonObject &buffer);
 bool initConfiguration();
 bool loadConfiguration();
 bool saveConfiguration(JsonObject& configuration);
-
-void handleRequest(AsyncWebServerRequest *request, uint8_t *data);
-void handleCommand(JsonObject &root);
 
 uint8_t commandedColorH = 0;
 uint8_t commandedColorS = 0;
@@ -67,33 +77,46 @@ void setup() {
   SPIFFS.begin();
 
   loadConfiguration();
-  configureDNS();
+  // configureDNS();
   configureOTA();
   configureServer();
 
   Serial.println("Ready");
 }
 
+bool isDataChanged() {
+  if (actualColorH != commandedColorH) return true;
+  if (actualColorS != commandedColorS) return true;
+  if (actualColorV != commandedColorV) return true;
+
+  if (actualBrightness != commandedBrightness) return true;
+
+  return false;
+}
+
 void loop() {
-  dnsServer.processNextRequest();
+  // dnsServer.processNextRequest();
+  server.handleClient();
   ArduinoOTA.handle();
+
+  if (isDataChanged()) {
+    actualColorH = commandedColorH;
+    actualColorS = commandedColorS;
+    actualColorV = commandedColorV;
   
-  actualColorH = commandedColorH;
-  actualColorS = commandedColorS;
-  actualColorV = commandedColorV;
-
-  actualBrightness = commandedBrightness;
-
-  uint8_t h = actualColorH;
-  uint8_t s = actualColorS;
-  uint8_t v = actualColorV;
-
-  CHSV color = CHSV(h, s, v);
-  uint8_t brightness = map(actualBrightness, 0, 255, 0, maxBrightness);
-
-  FastLED.showColor(color, brightness);
+    actualBrightness = commandedBrightness;
   
-  delay(10);
+    uint8_t h = actualColorH;
+    uint8_t s = actualColorS;
+    uint8_t v = actualColorV;
+  
+    CHSV color = CHSV(h, s, v);
+    uint8_t brightness = map(actualBrightness, 0, 255, 0, maxBrightness);
+  
+    FastLED.showColor(color, brightness);
+  }
+  
+  delay(20);
 }
 
 void blink(CRGB onColor, CRGB offColor, uint8_t delayTime, uint8_t times, uint8_t brightness = 10) {
@@ -161,23 +184,18 @@ void configureLeds() {
 }
 
 void configureServer() {
-  server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    DynamicJsonBuffer responseBuffer;
-    JsonObject& responseObject = responseBuffer.createObject();
-    
-    handleRequest(request, data, responseObject);
-    
-    String responseText;
-    responseObject.prettyPrintTo(responseText);
-    
-    if (responseObject.containsKey("error")) {
-      int errorCode = responseObject["errorCode"];
-      
-      request->send(errorCode, "application/json", responseText);
-    } else {
-      request->send(200, "application/json", responseText);
-    }
-  });
+  server.on("/ping", HTTP_GET, handlePing);
+  
+  server.on("/power", HTTP_POST, handlePower);
+  
+  server.on("/color", handleColor);
+  server.on("/brightness", handleBrightness);
+
+  server.on("/configuration", handleConfiguration);
+
+  server.on("/default", HTTP_POST, handleDefault);
+
+  server.onNotFound(sendNotFound);
 
   server.begin();
 }
@@ -192,90 +210,152 @@ void setBrightness(double brightness) {
   commandedBrightness = mapDouble(constrain(brightness, 0, 1), 0, 1, 0, maxBrightness);
 }
 
-void handleRequest(AsyncWebServerRequest *request, uint8_t *data, JsonObject &response) {  
-  if (request->url() == "/command") {
-    DynamicJsonBuffer requestBuffer;
-    JsonObject &requestObject = requestBuffer.parseObject((const char*) data);
-    
-    if (!requestObject.success()) {
-      response["errorCode"] = 422;
-      response["error"] = "Unprocessable Entity";
-    } else {
-      handleCommand(requestObject, response);
-    }
+void sendNotFound() {
+  server.send(404, "text/plain", "Not Found");
+}
+
+void sendBadRequest() {
+  server.send(400, "text/plain", "Bad request");
+}
+
+void sendOk() {
+  server.send(200, "text/plain", "OK");
+}
+
+void sendOKJson(JsonObject &buffer) {
+  String response; 
+  buffer.prettyPrintTo(response);
+
+  server.send(200, "application/json", response);
+}
+
+void handlePing() {
+  server.client().setNoDelay(true);
+  
+  if (server.hasArg("payload")) {
+    server.send(200, "text/plain", server.arg("payload"));
   } else {
-    response["errorCode"] = 404;
-    response["error"] = "Not Found";
+    sendBadRequest();
   }
 }
 
-JsonObject& handleCommand(JsonObject &request, JsonObject &response) {  
-  if (!request.containsKey("type")) {
-    response["errorCode"] = 400;
-    response["error"] = "Bad Request";
+void handlePower() {
+  server.client().setNoDelay(true);
+  
+  if (server.hasArg("status")) {
+    bool status = server.arg("status") == "on";
+    double brightness = status ? 0.1 : 0;
+      
+    setBrightness(brightness);
+    sendOk();
   } else {
-    const char *command = request["type"];
-
-    if (strcmp(command, "PING") == 0) {
-      response["pong"] = request["payload"];
-    } else if (strcmp(command, "POWER_ON") == 0) {
-      double brightness = 0.1;
-      
-      setBrightness(brightness);
-  
-      response.set("brightness", brightness);
-    } else if (strcmp(command, "POWER_OFF") == 0) {
-      double brightness = request.get<double>("brightness");
-      
-      setBrightness(brightness);
-  
-      response.set("brightness", brightness);
-    } else if (strcmp(command, "SET_BRIGHTNESS") == 0) {
-      double brightness = request.get<double>("brightness");
-      
-      setBrightness(brightness);
-  
-      response.set("brightness", brightness);
-    } else if (strcmp(command, "SET_COLOR") == 0) {
-      JsonObject& color = request["color"];
-      
-      double h = color.get<double>("h");
-      double s = color.get<double>("s");
-      double v = color.get<double>("v");
-      
-      setColor(h, s, v);
-  
-      JsonObject& responseColor = response.createNestedObject("color");
-      
-      responseColor.set("h", h);
-      responseColor.set("s", s);
-      responseColor.set("v", v);
-    } else if (strcmp(command, "GET_CONFIGURATION") == 0) {
-      getConfiguration(response);
-    } else if (strcmp(command, "SET_CONFIGURATION") == 0) {
-      JsonObject& color = request["color"];
-      
-      double h = color.get<double>("h");
-      double s = color.get<double>("s");
-      double v = color.get<double>("v");
-
-      double brightness = request.get<double>("brightness");
-      
-      setColor(h, s, v);
-      setBrightness(brightness);
-
-      JsonObject& responseColor = response.createNestedObject("color");
-      
-      responseColor.set("h", h);
-      responseColor.set("s", s);
-      responseColor.set("v", v);
-
-      response.set("brightness", brightness);
-    } else if (strcmp(command, "SET_DEFAULT") == 0) {
-      getConfiguration(response);
-      saveConfiguration(response);
-    } 
+    sendBadRequest();
   }
+}
+
+void handleColor() {
+  server.client().setNoDelay(true);
+  
+  if (server.method() == HTTP_GET) {
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& color = jsonBuffer.createObject();
+
+    color.set("h", mapDouble(commandedColorH, 0, 255, 0, 360));
+    color.set("s", mapDouble(commandedColorS, 0, 255, 0, 1));
+    color.set("v", mapDouble(commandedColorV, 0, 255, 0, 1));
+
+    sendOKJson(color);
+    jsonBuffer.clear();
+  } else if (server.method() == HTTP_POST) {
+    if (server.hasArg("colorH") && server.hasArg("colorS") && server.hasArg("colorV")) {     
+      double h = server.arg("colorH").toFloat();
+      double s = server.arg("colorS").toFloat();
+      double v = server.arg("colorV").toFloat();
+      
+      setColor(h, s, v);
+      sendOk();
+    } else {
+      sendBadRequest();
+    }
+  } else {
+    sendBadRequest();
+  }
+}
+
+void handleBrightness() {
+  server.client().setNoDelay(true);
+  
+  if (server.method() == HTTP_GET) {
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& brightness = jsonBuffer.createObject();
+    
+    brightness.set("brightness", mapDouble(commandedBrightness, 0, 255, 0, 1));
+
+    sendOKJson(brightness);
+    jsonBuffer.clear();
+  } else if (server.method() == HTTP_POST) {
+    if (server.hasArg("brightness")) {     
+      double brightness = server.arg("brightness").toFloat();
+      
+      setBrightness(brightness);
+      sendOk();
+    } else {
+      sendBadRequest();
+    }
+  } else {
+    sendBadRequest();
+  }
+}
+
+void handleConfiguration() {
+  server.client().setNoDelay(true);
+  
+  DynamicJsonBuffer jsonBuffer;
+  JsonObject& configuration = jsonBuffer.createObject();
+  
+  if (server.method() == HTTP_GET) {
+    getConfiguration(configuration);
+    sendOKJson(configuration);
+  } else if (server.method() == HTTP_POST) {
+    if (server.hasArg("brightness") && server.hasArg("colorH") && server.hasArg("colorS") && server.hasArg("colorV")) {     
+      double brightness = server.arg("brightness").toFloat();
+
+      double h = server.arg("colorH").toFloat();
+      double s = server.arg("colorS").toFloat();
+      double v = server.arg("colorV").toFloat();
+      
+      setBrightness(brightness);
+      setColor(h, s, v);
+
+      configuration.set("brightness", brightness);
+  
+      JsonObject& color = configuration.createNestedObject("color");
+    
+      color.set("h", h);
+      color.set("s", s);
+      color.set("v", v);
+      
+      sendOKJson(configuration);
+    } else {
+      sendBadRequest();
+    }
+  } else {
+    sendBadRequest();
+  }
+
+  jsonBuffer.clear();
+}
+
+void handleDefault() {
+  server.client().setNoDelay(true);
+  
+  DynamicJsonBuffer jsonBuffer;
+  JsonObject& configuration = jsonBuffer.createObject();
+
+  getConfiguration(configuration);
+  saveConfiguration(configuration);
+
+  sendOk();
 }
 
 void getConfiguration(JsonObject &buffer) {  
@@ -307,7 +387,11 @@ bool initConfiguration() {
   
   getConfiguration(configuration);
 
-  return saveConfiguration(configuration);
+  bool isConfigurationSaved = saveConfiguration(configuration);
+
+  jsonBuffer.clear();
+
+  return isConfigurationSaved;
 }
 
 bool reinitConfiguration(File file) {
@@ -335,11 +419,15 @@ bool loadConfiguration() {
   DynamicJsonBuffer jsonBuffer;
   JsonObject& root = jsonBuffer.parseObject(buf.get());
   
-  if (!root.success()) {    
+  if (!root.success()) {
+    jsonBuffer.clear();
+    
     return reinitConfiguration(configFile);
   }
 
-  if (!root.containsKey("brightness") || !root.containsKey("color")) {    
+  if (!root.containsKey("brightness") || !root.containsKey("color")) {  
+    jsonBuffer.clear();
+      
     return reinitConfiguration(configFile);
   }
 
@@ -357,6 +445,8 @@ bool loadConfiguration() {
 
   setColor(h, s, v);
   setBrightness(brightness);
+
+  jsonBuffer.clear();
   
   return true;
 }
